@@ -1,12 +1,12 @@
 import './App.css'
-import HomePage from './pages/home'
+import HomePage from "./pages/Home"
 
 function App() {
 
 
   return (
     <>
-      <HomePage/>
+      <Homeage/>
     </>
   )
 }

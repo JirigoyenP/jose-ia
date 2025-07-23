@@ -1,0 +1,90 @@
+#!/bin/bash
+
+gather_react_context() {
+    local context=""
+    
+    # Current location and Git info
+    context="Current directory: $(pwd)\n"
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        context="${context}Git branch: $(git branch --show-current)\n"
+        context="${context}Modified files: $(git status --porcelain | grep -E '\.(tsx?|jsx?)$' | head -5)\n"
+    fi
+    
+    # React project structure
+    context="${context}Project structure:\n$(tree -L 3 -I 'node_modules|dist|build|.next' 2>/dev/null || find . -maxdepth 3 -type d | grep -v node_modules | head -15)\n"
+    
+    # Package.json info (React/TS dependencies)
+    if [ -f "package.json" ]; then
+        context="${context}Framework info:\n$(cat package.json | jq -r '"\(.name) - \(.version)"' 2>/dev/null || grep '"name"' package.json)\n"
+        context="${context}Key dependencies:\n$(cat package.json | grep -E '(react|typescript|next|vite|tailwind|mui|chakra)' | head -8)\n"
+    fi
+    
+    # TypeScript config
+    if [ -f "tsconfig.json" ]; then
+        context="${context}TypeScript config: Present\n"
+    fi
+    
+    # Recent React/TS files
+    context="${context}Recent components/files:\n$(find . -name "*.tsx" -o -name "*.ts" -o -name "*.jsx" | grep -v node_modules | head -8)\n"
+    
+    # Common React patterns in project
+    if [ -d "src/components" ]; then
+        context="${context}Components: $(ls src/components/ 2>/dev/null | head -5 | tr '\n' ', ')\n"
+    fi
+    
+    if [ -d "src/hooks" ]; then
+        context="${context}Custom hooks: $(ls src/hooks/ 2>/dev/null | head -3 | tr '\n' ', ')\n"
+    fi
+    
+    # Build/config files
+    BUILD_FILES=$(find . -maxdepth 1 -name "vite.config.*" -o -name "next.config.*" -o -name "webpack.config.*" | head -2)
+    if [ ! -z "$BUILD_FILES" ]; then
+        context="${context}Build config: $BUILD_FILES\n"
+    fi
+    
+    echo -e "$context"
+}
+
+main() {
+    if [ $# -eq 0 ]; then
+        echo "⚛️ TypeScript React AI Assistant"
+        echo "Analyzing your React project..."
+        
+        CONTEXT=$(gather_react_context)
+        
+        ollama run mistral "You are a TypeScript React expert. Based on this project:
+
+$CONTEXT
+
+Analyze this React/TypeScript project and suggest 4-5 specific development tasks:
+
+Focus on:
+- Component improvements/refactoring
+- TypeScript type safety improvements  
+- React patterns/performance optimizations
+- Testing opportunities
+- Code organization/architecture
+
+Format as numbered actionable suggestions, then ask what I'd like to work on."
+
+    else
+        CONTEXT=$(gather_react_context)
+        QUESTION="$*"
+        
+        ollama run mistral "You are a TypeScript React expert with full project context.
+
+PROJECT CONTEXT:
+$CONTEXT
+
+QUESTION: $QUESTION
+
+Provide TypeScript React-specific advice. Include:
+- Proper TypeScript types when relevant
+- React best practices
+- Modern React patterns (hooks, composition, etc.)
+- Performance considerations
+- Code examples in TypeScript/TSX format"
+    fi
+}
+
+main "$@"

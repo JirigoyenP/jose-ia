@@ -216,7 +216,7 @@ const HomePage = () => {
           {t('section.recentUpdates', currentLanguage)}
         </h2>
         
-        {journeyEntries.map((entry, index) => (
+        {journeyEntries.map((entry, _) => (
           <div key={entry.id} style={styles.entryCard}>
             <h3 style={styles.entryTitle}>
               {t(`entry.title${entry.id}`, currentLanguage)}

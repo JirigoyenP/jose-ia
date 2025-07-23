@@ -1,0 +1,38 @@
+#!/bin/bash
+COMPONENT="$1"
+shift
+QUESTION="$*"
+
+if [ ! -f "$COMPONENT" ]; then
+    echo "Component not found: $COMPONENT"
+    exit 1
+fi
+
+# Get related files (types, styles, tests)
+BASENAME=$(basename "$COMPONENT" .tsx)
+DIRNAME=$(dirname "$COMPONENT")
+RELATED=$(find "$DIRNAME" -name "*$BASENAME*" -type f | grep -v node_modules)
+
+CONTEXT="Main component: $COMPONENT
+$(cat "$COMPONENT")
+
+Related files: $RELATED"
+
+if [ ! -z "$RELATED" ]; then
+    for file in $RELATED; do
+        if [ "$file" != "$COMPONENT" ] && [ -f "$file" ]; then
+            CONTEXT="$CONTEXT
+
+$file:
+$(cat "$file" | head -20)"
+        fi
+    done
+fi
+
+ollama run mistral "CONTEXT: $CONTEXT
+
+You're analyzing a React TypeScript component. 
+
+QUESTION: $QUESTION
+
+Focus on React/TypeScript best practices, performance, and maintainability."
