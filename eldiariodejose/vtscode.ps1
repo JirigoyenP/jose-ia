@@ -1,5 +1,26 @@
-# vtscode.ps1 - Enhanced Windows PowerShell Version with Full Repo Context
-param([string]$Question)
+# vtscode.ps1 - Enhanced with Auto-Apply Changes Feature
+param(
+    [string]$Question,
+    [switch]$AutoApply,
+    [switch]$Interactive
+)
+
+# ANSI color codes for better output
+$script:Colors = @{
+    Reset = "`e[0m"
+    Red = "`e[31m"
+    Green = "`e[32m"
+    Yellow = "`e[33m"
+    Blue = "`e[34m"
+    Magenta = "`e[35m"
+    Cyan = "`e[36m"
+    Bold = "`e[1m"
+}
+
+function Write-ColorHost {
+    param([string]$Message, [string]$Color = "Reset")
+    Write-Host "$($script:Colors[$Color])$Message$($script:Colors.Reset)"
+}
 
 function Get-FileContent {
     param(
@@ -23,6 +44,278 @@ function Get-ImportantFiles {
         Select-Object -First $MaxFiles
     
     return $files
+}
+
+function Parse-CodeBlocks {
+    param([string]$Response)
+    
+    $codeBlocks = @()
+    $pattern = '```(?<lang>\w+)?\s*\n(?<code>[\s\S]*?)```'
+    $filePattern = '(?:(?://|#|--)\s*(?:File:|file:|FILE:)\s*(?<file>[^\n]+)|(?<file>[\w\./\-]+\.(?:tsx?|jsx?|css|scss|json|md|html|yml|yaml|env|config\.\w+)))'
+    
+    $matches = [regex]::Matches($Response, $pattern)
+    
+    foreach ($match in $matches) {
+        $code = $match.Groups['code'].Value
+        $lang = $match.Groups['lang'].Value
+        
+        # Try to extract filename from comment at the beginning of code block
+        $firstLines = ($code -split "`n")[0..2] -join "`n"
+        $fileMatch = [regex]::Match($firstLines, $filePattern)
+        
+        $fileName = $null
+        if ($fileMatch.Success) {
+            $fileName = $fileMatch.Groups['file'].Value.Trim()
+            # Remove the filename comment from the code
+            $code = $code -replace "^.*$([regex]::Escape($fileName)).*\n", ""
+        }
+        
+        # If no filename in comment, check if the previous line mentions a file
+        if (-not $fileName) {
+            $startIndex = [Math]::Max(0, $match.Index - 200)
+            $contextBefore = $Response.Substring($startIndex, $match.Index - $startIndex)
+            $contextLines = ($contextBefore -split "`n")[-3..-1] -join "`n"
+            
+            if ($contextLines -match '(?:(?:create|update|modify|edit|change|Create|Update|Modify|Edit|Change)\s+)?(?:file\s+)?[`"]?([^\s`"]+\.(?:tsx?|jsx?|css|scss|json|md|html|yml|yaml|env|config\.\w+))[`"]?') {
+                $fileName = $matches[1]
+            }
+        }
+        
+        if ($fileName -and $code.Trim()) {
+            $codeBlocks += @{
+                FileName = $fileName
+                Language = $lang
+                Code = $code.Trim()
+                OriginalMatch = $match.Value
+            }
+        }
+    }
+    
+    return $codeBlocks
+}
+
+function Parse-CommandInstructions {
+    param([string]$Response)
+    
+    $commands = @()
+    
+    # Pattern for npm/yarn commands
+    $cmdPattern = '(?:^|\n)\s*(?:npm|yarn|pnpm|npx)\s+[^\n]+'
+    $cmdMatches = [regex]::Matches($Response, $cmdPattern)
+    
+    foreach ($match in $cmdMatches) {
+        $cmd = $match.Value.Trim()
+        if ($cmd -and $cmd -notmatch '```') {
+            $commands += @{
+                Type = "shell"
+                Command = $cmd
+            }
+        }
+    }
+    
+    # Pattern for file operations
+    $fileOpPattern = '(?:^|\n)\s*(?:create|delete|rename|move|Create|Delete|Rename|Move)\s+(?:file|directory|folder)\s*:?\s*([^\n]+)'
+    $fileOpMatches = [regex]::Matches($Response, $fileOpPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    
+    foreach ($match in $fileOpMatches) {
+        $operation = $match.Value.Trim()
+        $commands += @{
+            Type = "fileop"
+            Command = $operation
+        }
+    }
+    
+    return $commands
+}
+
+function Show-ChangeSummary {
+    param($CodeBlocks, $Commands)
+    
+    Write-ColorHost "`n📋 PROPOSED CHANGES SUMMARY" "Cyan"
+    Write-ColorHost ("=" * 50) "Cyan"
+    
+    if ($CodeBlocks.Count -gt 0) {
+        Write-ColorHost "`n📝 Files to modify:" "Yellow"
+        foreach ($block in $CodeBlocks) {
+            $exists = Test-Path $block.FileName
+            $status = if ($exists) { "[UPDATE]" } else { "[CREATE]" }
+            $statusColor = if ($exists) { "Yellow" } else { "Green" }
+            Write-ColorHost "   $status $($block.FileName)" $statusColor
+        }
+    }
+    
+    if ($Commands.Count -gt 0) {
+        Write-ColorHost "`n🔧 Commands to run:" "Yellow"
+        foreach ($cmd in $Commands) {
+            Write-ColorHost "   $($cmd.Command)" "Blue"
+        }
+    }
+    
+    Write-ColorHost "`n" "Reset"
+}
+
+function Backup-File {
+    param([string]$FilePath)
+    
+    if (Test-Path $FilePath) {
+        $backupDir = ".vtscode-backups"
+        if (-not (Test-Path $backupDir)) {
+            New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        }
+        
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $fileName = Split-Path $FilePath -Leaf
+        $backupPath = Join-Path $backupDir "$fileName.$timestamp.bak"
+        
+        Copy-Item -Path $FilePath -Destination $backupPath -Force
+        return $backupPath
+    }
+    return $null
+}
+
+function Apply-CodeBlock {
+    param($Block)
+    
+    $filePath = $Block.FileName
+    $directory = Split-Path $filePath -Parent
+    
+    # Create directory if needed
+    if ($directory -and -not (Test-Path $directory)) {
+        Write-ColorHost "Creating directory: $directory" "Blue"
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    
+    # Backup existing file
+    $backupPath = Backup-File -FilePath $filePath
+    if ($backupPath) {
+        Write-ColorHost "Backed up: $filePath → $backupPath" "Magenta"
+    }
+    
+    # Apply the change
+    try {
+        Set-Content -Path $filePath -Value $Block.Code -Encoding UTF8
+        Write-ColorHost "✅ Applied changes to: $filePath" "Green"
+        return $true
+    } catch {
+        Write-ColorHost "❌ Failed to apply changes to: $filePath - $_" "Red"
+        if ($backupPath) {
+            Copy-Item -Path $backupPath -Destination $filePath -Force
+            Write-ColorHost "Restored from backup" "Yellow"
+        }
+        return $false
+    }
+}
+
+function Execute-Command {
+    param($Command)
+    
+    Write-ColorHost "Executing: $($Command.Command)" "Blue"
+    
+    try {
+        if ($Command.Type -eq "shell") {
+            $result = Invoke-Expression $Command.Command 2>&1
+            Write-ColorHost "✅ Command executed successfully" "Green"
+            if ($result) {
+                Write-Host $result
+            }
+            return $true
+        } elseif ($Command.Type -eq "fileop") {
+            # Handle file operations
+            if ($Command.Command -match '(?:create|Create)\s+(?:file|directory|folder)\s*:?\s*(.+)') {
+                $path = $matches[1].Trim()
+                if ($path -match '\.\w+$') {
+                    # It's a file
+                    New-Item -ItemType File -Path $path -Force | Out-Null
+                } else {
+                    # It's a directory
+                    New-Item -ItemType Directory -Path $path -Force | Out-Null
+                }
+                Write-ColorHost "✅ Created: $path" "Green"
+                return $true
+            }
+        }
+    } catch {
+        Write-ColorHost "❌ Command failed: $_" "Red"
+        return $false
+    }
+}
+
+function Apply-Changes {
+    param(
+        [string]$Response,
+        [bool]$AutoApply,
+        [bool]$Interactive
+    )
+    
+    $codeBlocks = Parse-CodeBlocks -Response $Response
+    $commands = Parse-CommandInstructions -Response $Response
+    
+    if ($codeBlocks.Count -eq 0 -and $commands.Count -eq 0) {
+        Write-ColorHost "`nNo code changes or commands detected in the response." "Yellow"
+        return
+    }
+    
+    Show-ChangeSummary -CodeBlocks $codeBlocks -Commands $commands
+    
+    if (-not $AutoApply) {
+        $apply = Read-Host "`nDo you want to apply these changes? (Y/N/I for interactive)"
+        
+        if ($apply -eq 'I') {
+            $Interactive = $true
+        } elseif ($apply -ne 'Y') {
+            Write-ColorHost "Changes not applied." "Yellow"
+            return
+        }
+    }
+    
+    # Apply code changes
+    foreach ($block in $codeBlocks) {
+        if ($Interactive) {
+            Write-ColorHost "`n--- File: $($block.FileName) ---" "Cyan"
+            Write-Host $block.Code
+            Write-Host ""
+            
+            $action = Read-Host "Apply this change? (Y/N/S to skip all)"
+            if ($action -eq 'S') {
+                Write-ColorHost "Skipping remaining changes." "Yellow"
+                break
+            } elseif ($action -ne 'Y') {
+                Write-ColorHost "Skipped: $($block.FileName)" "Yellow"
+                continue
+            }
+        }
+        
+        Apply-CodeBlock -Block $block
+    }
+    
+    # Execute commands
+    foreach ($cmd in $commands) {
+        if ($Interactive) {
+            Write-ColorHost "`n--- Command ---" "Cyan"
+            Write-Host $cmd.Command
+            
+            $action = Read-Host "`nExecute this command? (Y/N/S to skip all)"
+            if ($action -eq 'S') {
+                Write-ColorHost "Skipping remaining commands." "Yellow"
+                break
+            } elseif ($action -ne 'Y') {
+                Write-ColorHost "Skipped command" "Yellow"
+                continue
+            }
+        }
+        
+        Execute-Command -Command $cmd
+    }
+    
+    Write-ColorHost "`n✨ All changes have been processed!" "Green"
+    
+    # Offer to run git diff
+    if (Test-Path ".git") {
+        $showDiff = Read-Host "`nShow git diff? (Y/N)"
+        if ($showDiff -eq 'Y') {
+            git diff
+        }
+    }
 }
 
 function Gather-ViteReactContext {
@@ -116,26 +409,28 @@ Project type: Vite + TypeScript + React
     $context += "`n=== PROJECT STRUCTURE ===`n"
     
     # Get directory tree (limited depth)
+    $treeOutput = ""
     function Get-DirectoryTree {
-        param([string]$Path, [int]$Depth = 3, [int]$CurrentDepth = 0)
+        param([string]$Path, [int]$Depth = 3, [int]$CurrentDepth = 0, [string]$Indent = "")
         
         if ($CurrentDepth -ge $Depth) { return }
         
         $items = Get-ChildItem -Path $Path -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notmatch '^(node_modules|\.git|dist|build|coverage)$' }
+            Where-Object { $_.Name -notmatch '^(node_modules|\.git|dist|build|coverage|\.vtscode-backups)$' }
         
         foreach ($item in $items) {
-            $indent = "  " * $CurrentDepth
+            $script:treeOutput += "$Indent$($item.Name)"
             if ($item.PSIsContainer) {
-                $context += "$indent$($item.Name)/`n"
-                Get-DirectoryTree -Path $item.FullName -Depth $Depth -CurrentDepth ($CurrentDepth + 1)
+                $script:treeOutput += "/`n"
+                Get-DirectoryTree -Path $item.FullName -Depth $Depth -CurrentDepth ($CurrentDepth + 1) -Indent "$Indent  "
             } else {
-                $context += "$indent$($item.Name)`n"
+                $script:treeOutput += "`n"
             }
         }
     }
     
     Get-DirectoryTree -Path "." -Depth 3
+    $context += $treeOutput
     
     # Source files analysis
     $context += "`n=== KEY SOURCE FILES ===`n"
@@ -226,9 +521,12 @@ Project type: Vite + TypeScript + React
     # Check for CSS framework
     if (Test-Path "tailwind.config.js" -or Test-Path "tailwind.config.ts") {
         $context += "Styling: Tailwind CSS detected`n"
-        $tailwindConfig = Get-FileContent "tailwind.config.*" -MaxLines 30
+        $tailwindConfig = Get-ChildItem "tailwind.config.*" | Select-Object -First 1
         if ($tailwindConfig) {
-            $context += "Tailwind config preview:`n$tailwindConfig`n"
+            $content = Get-FileContent $tailwindConfig.FullName -MaxLines 30
+            if ($content) {
+                $context += "Tailwind config preview:`n$content`n"
+            }
         }
     }
     
@@ -301,44 +599,55 @@ Project type: Vite + TypeScript + React
 
 # Main script logic
 if (-not $Question) {
-    Write-Host "⚡ Vite + TypeScript React AI Assistant (Enhanced)" -ForegroundColor Cyan
-    Write-Host "Performing deep analysis of your entire repository..." -ForegroundColor Yellow
+    Write-ColorHost "⚡ Vite + TypeScript React AI Assistant (with Auto-Apply)" "Cyan"
+    Write-ColorHost "Performing deep analysis of your entire repository..." "Yellow"
     
     $context = Gather-ViteReactContext
-    
-    # Save context to temp file for large prompts
-    $tempFile = [System.IO.Path]::GetTempFileName()
-    Set-Content -Path $tempFile -Value $context
     
     $prompt = @"
 You are a Vite + TypeScript + React expert. I've analyzed this entire repository:
 
 $context
 
-Based on this comprehensive analysis, suggest 5-7 specific, high-impact improvements:
+Based on this comprehensive analysis, suggest 5-7 specific, high-impact improvements.
 
-1. Architecture improvements based on current structure
-2. Performance optimizations specific to the codebase
-3. TypeScript type safety enhancements
-4. Component refactoring opportunities
-5. State management improvements
-6. Testing gaps that need attention
-7. Build/deployment optimizations
+IMPORTANT: When suggesting code changes:
+1. Always include the COMPLETE file content in code blocks
+2. Add a comment with the filename at the top of each code block
+3. Use proper markdown code blocks with language specification
+4. For shell commands, write them clearly on separate lines
 
-Be specific to THIS codebase, reference actual files/components. Format as actionable tasks.
+Example format:
+\`\`\`typescript
+// File: src/components/Button.tsx
+import React from 'react';
+
+export const Button = () => {
+  return <button>Click me</button>;
+};
+\`\`\`
+
+To install dependencies:
+npm install package-name
+
+Be specific to THIS codebase, reference actual files/components.
 "@
 
-    # Use file input for large context
-    ollama run mixtral:8x7b $prompt
+    Write-ColorHost "`nGetting AI recommendations..." "Yellow"
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $tempFile -Value $prompt
+    
+    $response = & ollama run mixtral:8x7b "$(Get-Content $tempFile -Raw)"
+    Write-Host $response
     
     Remove-Item $tempFile -ErrorAction SilentlyContinue
-} else {
-    Write-Host "Gathering full repository context..." -ForegroundColor Yellow
-    $context = Gather-ViteReactContext
     
-    # Save context to temp file
-    $tempFile = [System.IO.Path]::GetTempFileName()
-    Set-Content -Path $tempFile -Value $context
+    # Offer to apply changes
+    Apply-Changes -Response $response -AutoApply $AutoApply -Interactive $Interactive
+    
+} else {
+    Write-ColorHost "Gathering full repository context..." "Yellow"
+    $context = Gather-ViteReactContext
     
     $prompt = @"
 You are a Vite + TypeScript + React expert with COMPLETE knowledge of this codebase.
@@ -348,21 +657,33 @@ $context
 
 USER QUESTION: $Question
 
-Provide a detailed, specific answer based on:
-- The actual code and structure in THIS repository
-- Reference specific files, components, and patterns you see
-- Consider the dependencies and configurations present
-- Suggest changes that fit the existing architecture
-- Include code examples that match the project's style
-- Consider the current state management approach
-- Account for the routing structure
-- Respect the existing TypeScript configurations
+IMPORTANT INSTRUCTIONS:
+1. Provide specific, actionable answers with COMPLETE code
+2. When suggesting file changes, include the ENTIRE file content
+3. Add filename comments at the top of code blocks
+4. Use markdown code blocks with language specification
+5. For commands, write them clearly (npm install, etc.)
+6. Reference specific files from the codebase
+7. Match the project's existing patterns and style
 
-Your answer should be specifically tailored to THIS codebase, not generic advice.
+Format example:
+\`\`\`typescript
+// File: src/components/NewComponent.tsx
+[COMPLETE file content here]
+\`\`\`
+
+Your answer should include ready-to-apply code changes.
 "@
 
-    # Use more powerful model for complex analysis
-    ollama run mixtral:8x7b $prompt
+    Write-ColorHost "`nGetting AI response..." "Yellow"
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    Set-Content -Path $tempFile -Value $prompt
+    
+    $response = & ollama run mixtral:8x7b "$(Get-Content $tempFile -Raw)"
+    Write-Host $response
     
     Remove-Item $tempFile -ErrorAction SilentlyContinue
+    
+    # Apply changes if requested
+    Apply-Changes -Response $response -AutoApply $AutoApply -Interactive $Interactive
 }
